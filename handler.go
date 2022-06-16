@@ -28,6 +28,7 @@ import (
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 )
@@ -35,26 +36,34 @@ import (
 // Handler exposes the Handler methods
 type Handler struct{}
 
-type Domains map[string]string
+// type Domains map[string]string
+
+type InternalDomains struct {
+	Cname map[string]string   `json:"cname"`
+	Svc   map[string][]string `json:"svc"`
+}
+
+type Domains struct {
+	Ingress  map[string]string `json:"ingress"`
+	Internal InternalDomains   `json:"internal"`
+}
 
 // Index function renders the dashboard index page
 func (h *Handler) Index() fasthttp.RequestHandler {
 	return func(ctx *fasthttp.RequestCtx) {
 		logger := logger.New("domains-viewers", config.MyEnvConfig.Application.Debug)
 
-		domains := map[string]Domains{
-			"external": make(Domains),
-			"internal": make(Domains),
-		}
+		domains := Domains{}
 
 		// Debug Log
 		logger.Debug(domains)
 		clientSet := k8s.GetClientSet(logger)
 		dynamicClientSet := k8s.GetDynamic(logger)
 		ctx.SetContentType("application/json; charset=utf-8")
-		GetExternalServiceDomains(clientSet, logger, domains["external"])
-		GetInternalServiceDomains(clientSet, logger, domains["internal"])
-		GetKnativeServiceDomains(dynamicClientSet, logger, domains["external"])
+		GetExternalServiceDomains(clientSet, logger, &domains.Ingress)
+
+		GetInternalServiceDomains(clientSet, logger, &domains.Internal)
+		GetKnativeServiceDomains(dynamicClientSet, logger, &domains)
 		// fmt.Fprintf(ctx, `{"ingresses":"%s","internal":"%s","knative":"%s"}`, GetExternalServiceDomains(clientSet, logger), GetInternalServiceDomains(clientSet, logger), GetKnativeServiceDomains(clientSet, logger))
 		bytes, err := json.Marshal(domains)
 		if err != nil {
@@ -64,7 +73,11 @@ func (h *Handler) Index() fasthttp.RequestHandler {
 	}
 }
 
-func GetExternalServiceDomains(clientSet kubernetes.Interface, logger *zap.SugaredLogger, domains Domains) {
+func GetExternalServiceDomains(clientSet kubernetes.Interface, logger *zap.SugaredLogger, domains *map[string]string) {
+	if *domains == nil {
+		logger.Debug("nil domains in GetExternalServiceDomains")
+		*domains = make(map[string]string)
+	}
 	ingList, err := clientSet.NetworkingV1().Ingresses("").List(context.TODO(), v1.ListOptions{})
 	if err != nil {
 		logger.Panicw("error when getting ingress details", "ingress List", ingList, "err", err)
@@ -79,13 +92,19 @@ func GetExternalServiceDomains(clientSet kubernetes.Interface, logger *zap.Sugar
 						subPath += "/"
 					}
 				}
-				domains[rule.Host+subPath] = fmt.Sprintf("%s.%s:%d", path.Backend.Service.Name, ing.Namespace, path.Backend.Service.Port.Number)
+				(*domains)[rule.Host+subPath] = fmt.Sprintf("%s.%s:%d", path.Backend.Service.Name, ing.Namespace, path.Backend.Service.Port.Number)
 			}
 		}
 	}
 }
 
-func GetInternalServiceDomains(clientSet kubernetes.Interface, logger *zap.SugaredLogger, domains Domains) {
+func GetInternalServiceDomains(clientSet kubernetes.Interface, logger *zap.SugaredLogger, domains *InternalDomains) {
+	if domains.Cname == nil {
+		domains.Cname = make(map[string]string)
+	}
+	if domains.Svc == nil {
+		domains.Svc = make(map[string][]string)
+	}
 	svcList, err := clientSet.CoreV1().Services("").List(context.TODO(), v1.ListOptions{})
 	if err != nil {
 		logger.Panicw("error when getting internal services details", "service List", svcList, "err", err)
@@ -93,7 +112,26 @@ func GetInternalServiceDomains(clientSet kubernetes.Interface, logger *zap.Sugar
 	logger.Debug(len(svcList.Items))
 	for _, svc := range svcList.Items {
 		if svc.Spec.Type == "ExternalName" {
-			domains[fmt.Sprintf("%s.%s", svc.Name, svc.Namespace)] = strings.Replace(svc.Spec.ExternalName, ".svc.cluster.local", "", 1)
+			domains.Cname[fmt.Sprintf("%s.%s", svc.Name, svc.Namespace)] = strings.Replace(svc.Spec.ExternalName, ".svc.cluster.local", "", 1)
+		} else {
+			portStrings := []string{}
+			for _, port := range svc.Spec.Ports {
+
+				targetPort := ""
+
+				switch port.TargetPort.Type {
+				case intstr.Int:
+					targetPort = fmt.Sprint(port.TargetPort.IntVal)
+				case intstr.String:
+					targetPort = port.TargetPort.StrVal
+				}
+				if svc.Spec.Type == "NodePort" {
+					portStrings = append(portStrings, fmt.Sprintf("%d:%s:%d/%v", port.Port, targetPort, port.NodePort, port.Protocol))
+				} else {
+					portStrings = append(portStrings, fmt.Sprintf("%d:%s/%v", port.Port, targetPort, port.Protocol))
+				}
+			}
+			domains.Svc[fmt.Sprintf("%s.%s", svc.Name, svc.Namespace)] = portStrings
 		}
 	}
 }
@@ -104,7 +142,16 @@ var knativeServiceResource = schema.GroupVersionResource{
 	Resource: "services",
 }
 
-func GetKnativeServiceDomains(clientSet dynamic.Interface, logger *zap.SugaredLogger, domains Domains) {
+func GetKnativeServiceDomains(clientSet dynamic.Interface, logger *zap.SugaredLogger, domains *Domains) {
+	if domains.Ingress == nil {
+		domains.Ingress = make(map[string]string)
+	}
+	if domains.Internal.Cname == nil {
+		domains.Internal.Cname = make(map[string]string)
+	}
+	if domains.Internal.Svc == nil {
+		domains.Internal.Svc = make(map[string][]string)
+	}
 	objs, err := clientSet.Resource(knativeServiceResource).List(context.TODO(), v1.ListOptions{
 		LabelSelector: "route.external=true",
 	})
@@ -118,13 +165,15 @@ func GetKnativeServiceDomains(clientSet dynamic.Interface, logger *zap.SugaredLo
 
 	for _, item := range objs.Items {
 		internalUrl := fmt.Sprintf("%s.%s", item.GetName(), item.GetNamespace())
+		domains.Internal.Svc[internalUrl] = []string{
+			"80:knative-container-port/HTTP",
+		}
 		externalUrl, found, err := unstructured.NestedString(item.UnstructuredContent(), "status", "url")
-
 		if err != nil {
 			logger.Panicw("error when getting knative ksvc.status.url", "objs", objs, "err", err)
 		}
 		if found {
-			domains[strings.Replace(externalUrl, "https://", "", 1)] = internalUrl
+			domains.Ingress[strings.Replace(externalUrl, "https://", "", 1)] = internalUrl
 		}
 	}
 }
