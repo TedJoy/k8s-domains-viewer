@@ -44,7 +44,7 @@ type InternalDomains struct {
 }
 
 type Domains struct {
-	Ingress  map[string]string `json:"ingress"`
+	External map[string]string `json:"external"`
 	Internal InternalDomains   `json:"internal"`
 }
 
@@ -60,8 +60,8 @@ func (h *Handler) Index() fasthttp.RequestHandler {
 		clientSet := k8s.GetClientSet(logger)
 		dynamicClientSet := k8s.GetDynamic(logger)
 		ctx.SetContentType("application/json; charset=utf-8")
-		GetExternalServiceDomains(clientSet, logger, &domains.Ingress)
-
+		GetExternalServiceDomains(clientSet, logger, &domains.External)
+		GetVirtualServiceDomains(dynamicClientSet, logger, &domains.External)
 		GetInternalServiceDomains(clientSet, logger, &domains.Internal)
 		GetKnativeServiceDomains(dynamicClientSet, logger, &domains)
 		// fmt.Fprintf(ctx, `{"ingresses":"%s","internal":"%s","knative":"%s"}`, GetExternalServiceDomains(clientSet, logger), GetInternalServiceDomains(clientSet, logger), GetKnativeServiceDomains(clientSet, logger))
@@ -93,6 +93,81 @@ func GetExternalServiceDomains(clientSet kubernetes.Interface, logger *zap.Sugar
 					}
 				}
 				(*domains)[rule.Host+subPath] = fmt.Sprintf("%s.%s:%d", path.Backend.Service.Name, ing.Namespace, path.Backend.Service.Port.Number)
+			}
+		}
+	}
+}
+func GetVirtualServiceDomains(clientSet dynamic.Interface, logger *zap.SugaredLogger, domains *map[string]string) {
+	if *domains == nil {
+		logger.Debug("nil domains in GetVirtualServiceDomains")
+		*domains = make(map[string]string)
+	}
+	objs, err := clientSet.Resource(virtualServiceResource).List(context.TODO(), v1.ListOptions{})
+	if err != nil {
+		if err.Error() == "the server could not find the requested resource" {
+			return
+		} else {
+			logger.Panicw("error when getting virtualservice details", "objs", objs, "err", err)
+		}
+	}
+
+	for _, item := range objs.Items {
+		gateways, found, err := unstructured.NestedStringSlice(item.UnstructuredContent(), "spec", "gateways")
+		if err != nil {
+			logger.Panicw("error when getting virtualservice spec.gateways", "objs", objs, "err", err)
+		}
+		if !found {
+			return
+		}
+		internal := false
+		for _, gw := range gateways {
+			if strings.Contains(gw, "knative") || strings.Contains(gw, "mesh") {
+				internal = true
+			}
+		}
+		if internal {
+			return
+		}
+		hosts, found, err := unstructured.NestedStringSlice(item.UnstructuredContent(), "spec", "hosts")
+		if err != nil {
+			logger.Panicw("error when getting virtualservice spec.hosts", "objs", objs, "err", err)
+		}
+		if !found {
+			return
+		}
+		backends, found, err := unstructured.NestedSlice(item.UnstructuredContent(), "spec", "http")
+		if err != nil {
+			logger.Panicw("error when getting virtualservice spec.http", "objs", objs, "err", err)
+		}
+		if !found {
+			return
+		}
+
+		for _, backend := range backends {
+			backendMap := backend.(map[string]interface{})
+			for _, host := range hosts {
+				// matches := []string{"/"}
+				// if val, ok := backend["match"]; ok {
+
+				// }
+				logger.Info(host)
+				if routes, ok := backendMap["route"]; ok {
+					for _, route := range routes.([]interface{}) {
+						if _, ok := route.(map[string]interface{})["destination"]; ok {
+							// if err != nil {
+							// 	logger.Panicw("error when getting virtualservice spec.http", "objs", objs, "err", err)
+							// }
+							// if !found {
+							// 	return
+							// }
+
+							// if match in backend, else match /
+							// if destination in backend, else return
+							// key = host, value = destination.host:destination.port.number
+							(*domains)[host] = "abc"
+						}
+					}
+				}
 			}
 		}
 	}
@@ -142,9 +217,15 @@ var knativeServiceResource = schema.GroupVersionResource{
 	Resource: "services",
 }
 
+var virtualServiceResource = schema.GroupVersionResource{
+	Group:    "networking.istio.io",
+	Version:  "v1beta1",
+	Resource: "virtualservices",
+}
+
 func GetKnativeServiceDomains(clientSet dynamic.Interface, logger *zap.SugaredLogger, domains *Domains) {
-	if domains.Ingress == nil {
-		domains.Ingress = make(map[string]string)
+	if domains.External == nil {
+		domains.External = make(map[string]string)
 	}
 	if domains.Internal.Cname == nil {
 		domains.Internal.Cname = make(map[string]string)
@@ -173,7 +254,7 @@ func GetKnativeServiceDomains(clientSet dynamic.Interface, logger *zap.SugaredLo
 			logger.Panicw("error when getting knative ksvc.status.url", "objs", objs, "err", err)
 		}
 		if found {
-			domains.Ingress[strings.Replace(externalUrl, "https://", "", 1)] = internalUrl
+			domains.External[strings.Replace(externalUrl, "https://", "", 1)] = internalUrl
 		}
 	}
 }
