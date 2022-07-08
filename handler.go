@@ -146,25 +146,27 @@ func GetVirtualServiceDomains(clientSet dynamic.Interface, logger *zap.SugaredLo
 		for _, backend := range backends {
 			backendMap := backend.(map[string]interface{})
 			for _, host := range hosts {
-				// matches := []string{"/"}
-				// if val, ok := backend["match"]; ok {
+				matches := []string{"/"}
+				backendMapMatch := backendMap["match"]
+				if backendMapMatch == nil {
+					continue
+				}
 
-				// }
-				logger.Info(host)
+				for _, matchSlice := range backendMapMatch.([]interface{}) {
+					prefix := matchSlice.(map[string]interface{})["uri"].(map[string]interface{})["prefix"].(string)
+					matches = append(matches, prefix)
+				}
+
 				if routes, ok := backendMap["route"]; ok {
 					for _, route := range routes.([]interface{}) {
-						if _, ok := route.(map[string]interface{})["destination"]; ok {
-							// if err != nil {
-							// 	logger.Panicw("error when getting virtualservice spec.http", "objs", objs, "err", err)
-							// }
-							// if !found {
-							// 	return
-							// }
-
-							// if match in backend, else match /
-							// if destination in backend, else return
-							// key = host, value = destination.host:destination.port.number
-							(*domains)[host] = "abc"
+						if destination, ok := route.(map[string]interface{})["destination"]; ok {
+							for _, match := range matches {
+								endpoint := destination.(map[string]interface{})["host"].(string)
+								if strings.Count(endpoint, ".") == 0 {
+									endpoint = endpoint + "." + item.GetNamespace()
+								}
+								(*domains)[host+match] = endpoint
+							}
 						}
 					}
 				}
